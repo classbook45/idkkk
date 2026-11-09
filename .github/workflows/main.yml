@@ -1,0 +1,107 @@
+name: build-mario64mr
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**.z64'
+      - '**.v64'
+      - '**.n64'
+      - '**.zip'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: checkout private repo (holds your rom)
+        uses: actions/checkout@v4
+
+      - name: find rom, convert to z64, rename for the tool
+        shell: bash
+        run: |
+          mkdir -p rom_in rom_ready
+          find . -path ./.git -prune -o -type f -iname '*.zip' -print | while read -r z; do
+            unzip -o -q "$z" -d rom_in || true
+          done
+          ROM="$(find . -path ./.git -prune -o -type f \( -iname '*.z64' -o -iname '*.v64' -o -iname '*.n64' \) -not -path './rom_ready/*' -print | head -n 1)"
+          if [ -z "$ROM" ]; then
+            echo "no rom found in repo"
+            exit 1
+          fi
+          echo "found: $ROM"
+          python3 - "$ROM" << 'PY'
+          import sys, hashlib
+          data = bytearray(open(sys.argv[1], 'rb').read())
+          head = bytes(data[:4])
+          if head == b'\x80\x37\x12\x40':
+              pass
+          elif head == b'\x37\x80\x40\x12':
+              data[0::2], data[1::2] = data[1::2], data[0::2]
+          elif head == b'\x40\x12\x37\x80':
+              data[0::4], data[1::4], data[2::4], data[3::4] = data[3::4], data[2::4], data[1::4], data[0::4]
+          else:
+              sys.exit('not a recognized n64 rom header')
+          open('rom_ready/Super Mario 64 (USA).z64', 'wb').write(data)
+          sha = hashlib.sha1(data).hexdigest()
+          print('sha-1:', sha)
+          if sha != '9bef1128717f958171a4afac3ed78ee2bb4e86ce':
+              sys.exit('sha-1 mismatch: this is not Super Mario 64 (US)')
+          PY
+          echo "ROM_PATH=$GITHUB_WORKSPACE/rom_ready/Super Mario 64 (USA).z64" >> "$GITHUB_ENV"
+
+      - name: clone mario64mr
+        run: git clone --depth 1 https://github.com/lucas-martinic/mario64mr.git tool
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 unzip patch
+
+      - name: build game data (retries once with a clean work dir)
+        shell: bash
+        working-directory: tool
+        run: |
+          python3 install_mario64mr.py "$ROM_PATH" 2>&1 | tee ../build.log || {
+            echo "attempt 1 failed. clearing work dir. retrying."
+            rm -rf Mario64MRData-work
+            python3 install_mario64mr.py "$ROM_PATH" 2>&1 | tee -a ../build.log
+          }
+
+      - name: fetch apk from releases
+        continue-on-error: true
+        working-directory: tool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo lucas-martinic/mario64mr --pattern 'Mario64MR.apk'
+
+      - name: package
+        working-directory: tool
+        run: |
+          FILES="Mario64MRData"
+          if [ -f Mario64MR.apk ]; then FILES="$FILES Mario64MR.apk"; fi
+          zip -r ../mario64mr-build.zip $FILES
+
+      - name: upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: mario64mr-build
+          path: mario64mr-build.zip
+          retention-days: 7
+
+      - name: show last log lines on failure
+        if: failure()
+        run: |
+          echo '### build failed. last 60 log lines' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 60 build.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no log" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
